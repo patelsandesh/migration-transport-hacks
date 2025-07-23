@@ -1,0 +1,70 @@
+#!/usr/bin/env bpftrace
+#include <linux/socket.h>
+#include <linux/types.h>
+
+
+BEGIN
+{
+    printf("Tracing sendmsg syscalls... Hit Ctrl-C to end.\n");
+    printf("%-10s %-10s %-6s %-8s %-12s %-12s %s\n", "TIME", "PID", "TID", "FD", "IOVECS", "BYTES", "COMM");
+    @total_bytes = 0;
+    @total_calls = 0;
+    @iovlen;
+    @vlen;
+}
+
+tracepoint:syscalls:sys_enter_sendmsg
+{
+    $msghdr = args->msg;
+    $iov_count = $msghdr->msg_iovlen;
+    $iovec_ptr = $msghdr->msg_iov;
+    
+    $total_bytes = (uint64)0;
+    
+    @iovlen = hist($iov_count);
+    
+
+    // Sum up bytes from all iovec entries
+    $i = 0;
+    while ($i < $iov_count && $i < 32) {
+        $iovec = $iovec_ptr + $i;
+        $iov_len = ((struct iovec *)$iovec)->iov_len;
+        $total_bytes += $iov_len;
+        @vlen = hist($iov_len);
+        if ($iov_len < 16 || ($iov_len >= 4000 && $iov_len <= 8192)) {
+            @count_mig[$iov_len] = count();
+        }
+        
+        
+        $i++;
+    }
+    @iov_count[tid] = $iov_count;
+    @fd[tid] = args->fd;
+    
+    @total_bytes += $total_bytes;
+    @total_calls++;
+    @bytes_by_tid[tid] += $total_bytes;
+    @calls_by_tid[tid]++;
+}
+
+
+END
+{
+    printf("\n--- Summary ---\n");
+    printf("Total sendmsg calls: %d\n", @total_calls);
+    printf("Total bytes sent: %d\n", @total_bytes);
+    
+    printf("\n--- Per TID Stats ---\n");
+    print(@calls_by_tid, 6);
+    print(@bytes_by_tid, 6);
+    //for ($tid : @bytes_by_tid) {
+    //    printf("TID: %d, Calls: %d, Bytes: %d\n", tid, @calls_by_tid[tid], @bytes_by_tid[tid]);
+    //}
+    
+    clear(@iov_count);
+    clear(@fd);
+    clear(@total_bytes);
+    clear(@total_calls);
+    clear(@bytes_by_tid);
+    clear(@calls_by_tid);
+}
