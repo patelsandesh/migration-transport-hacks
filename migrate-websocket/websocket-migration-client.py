@@ -1,5 +1,6 @@
 import asyncio
 import websockets
+import ssl
 import os
 import logging
 
@@ -7,10 +8,36 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class MigrationWebSocketClient:
-    def __init__(self, server_url, unix_socket_path=None):
+    def __init__(self, server_url, unix_socket_path=None, cert_dir='certs'):
         self.server_url = server_url
         self.unix_socket_path = unix_socket_path or '/tmp/qemu_migration_source.sock'
+        self.cert_dir = cert_dir
         self.websocket = None
+        
+    def create_ssl_context(self):
+        """Create SSL context for secure WebSocket connection."""
+        ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        
+        # Load client certificate and key
+        cert_file = os.path.join(self.cert_dir, 'client-cert.pem')
+        key_file = os.path.join(self.cert_dir, 'client-key.pem')
+        ca_file = os.path.join(self.cert_dir, 'ca.pem')
+        
+        if not all(os.path.exists(f) for f in [cert_file, key_file, ca_file]):
+            raise FileNotFoundError(f"Certificate files not found in {self.cert_dir}. Run generate_certificates.py first.")
+        
+        # Load client certificate for authentication
+        ssl_context.load_cert_chain(cert_file, key_file)
+        
+        # Load CA certificate to verify server
+        ssl_context.load_verify_locations(ca_file)
+        
+        # Verify server certificate
+        ssl_context.check_hostname = False  # Set to True if using proper hostname
+        ssl_context.verify_mode = ssl.CERT_REQUIRED
+        
+        logger.info("SSL context created with client certificate authentication")
+        return ssl_context
         
     async def connect_and_forward(self):
         """Connect to WebSocket server and forward unix socket data."""
@@ -19,10 +46,16 @@ class MigrationWebSocketClient:
         if os.path.exists(self.unix_socket_path):
             os.unlink(self.unix_socket_path)
         
-        # Connect to WebSocket server
+        # Create SSL context
+        ssl_context = self.create_ssl_context()
+        
+        # Connect to secure WebSocket server
         try:
-            self.websocket = await websockets.connect(self.server_url)
-            logger.info(f"Connected to migration server at {self.server_url}")
+            self.websocket = await websockets.connect(
+                self.server_url,
+                ssl=ssl_context
+            )
+            logger.info(f"Securely connected to migration server at {self.server_url}")
         except Exception as e:
             logger.error(f"Failed to connect to server: {e}")
             return
@@ -127,10 +160,11 @@ class MigrationWebSocketClient:
 
 async def main():
     # Configuration
-    server_url = 'ws://10.117.30.218:8765'  # Replace with destination server IP/URL
+    server_url = 'wss://10.117.30.218:8766'  # Changed to wss:// and port 8766
     unix_socket_path = '/tmp/qemu_migration_source.sock'
+    cert_dir = 'certs'
     
-    client = MigrationWebSocketClient(server_url, unix_socket_path)
+    client = MigrationWebSocketClient(server_url, unix_socket_path, cert_dir)
     
     try:
         await client.connect_and_forward()

@@ -1,5 +1,6 @@
 import asyncio
 import websockets
+import ssl
 import os
 import logging
 
@@ -7,16 +8,49 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class MigrationWebSocketServer:
-    def __init__(self, host='0.0.0.0', port=8765, unix_socket_path=None):
+    def __init__(self, host='0.0.0.0', port=8766, unix_socket_path=None, cert_dir='certs'):
         self.host = host
         self.port = port
         self.unix_socket_path = unix_socket_path or '/tmp/qemu_migration_dest.sock'
+        self.cert_dir = cert_dir
         self.server = None
+        
+    def create_ssl_context(self):
+        """Create SSL context for secure WebSocket connections."""
+        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        
+        # Load server certificate and key
+        cert_file = os.path.join(self.cert_dir, 'server-cert.pem')
+        key_file = os.path.join(self.cert_dir, 'server-key.pem')
+        ca_file = os.path.join(self.cert_dir, 'ca.pem')
+        
+        if not all(os.path.exists(f) for f in [cert_file, key_file, ca_file]):
+            raise FileNotFoundError(f"Certificate files not found in {self.cert_dir}. Run generate_certificates.py first.")
+        
+        ssl_context.load_cert_chain(cert_file, key_file)
+        
+        # Enable client certificate verification
+        ssl_context.verify_mode = ssl.CERT_REQUIRED
+        ssl_context.load_verify_locations(ca_file)
+        
+        logger.info("SSL context created with client certificate verification")
+        return ssl_context
         
     async def handle_client(self, websocket):
         """Handle incoming WebSocket connection and forward to unix socket."""
         client_addr = websocket.remote_address
-        logger.info(f"WebSocket client connected from {client_addr}")
+        
+        # Get client certificate info
+        client_cert = websocket.transport.get_extra_info('ssl_object').getpeercert()
+        client_cn = None
+        if client_cert:
+            for item in client_cert.get('subject', []):
+                for key, value in item:
+                    if key == 'commonName':
+                        client_cn = value
+                        break
+        
+        logger.info(f"Secure WebSocket client connected from {client_addr} (CN: {client_cn})")
         
         try:
             # Wait for the unix socket to be available (QEMU creates it after migrate-incoming)
@@ -57,7 +91,7 @@ class MigrationWebSocketServer:
         except Exception as e:
             logger.error(f"Error handling client: {e}")
         finally:
-            logger.info(f"WebSocket client {client_addr} disconnected")
+            logger.info(f"Secure WebSocket client {client_addr} disconnected")
     
     async def wait_for_unix_socket(self, max_retries=30, retry_delay=1):
         """Wait for unix socket to become available and connect to it."""
@@ -123,7 +157,10 @@ class MigrationWebSocketServer:
             logger.info(f"Unix->WebSocket: Total bytes forwarded: {total_bytes}")
     
     async def start(self):
-        """Start the WebSocket server."""
+        """Start the secure WebSocket server."""
+        # Create SSL context
+        ssl_context = self.create_ssl_context()
+        
         # Create a wrapper function that properly handles the websockets callback
         async def handler(websocket):
             await self.handle_client(websocket)
@@ -131,11 +168,13 @@ class MigrationWebSocketServer:
         self.server = await websockets.serve(
             handler,
             self.host,
-            self.port
+            self.port,
+            ssl=ssl_context
         )
         
-        logger.info(f"Migration WebSocket server listening on ws://{self.host}:{self.port}")
+        logger.info(f"Secure Migration WebSocket server listening on wss://{self.host}:{self.port}")
         logger.info(f"Will connect to unix socket at: {self.unix_socket_path}")
+        logger.info("Client certificate authentication enabled")
         
         await self.server.wait_closed()
     
@@ -148,10 +187,11 @@ class MigrationWebSocketServer:
 async def main():
     # Configuration
     host = '0.0.0.0'  # Listen on all interfaces
-    port = 8765
+    port = 8766  # Changed from 8765 to 8766 for secure WebSocket
     unix_socket_path = '/tmp/qemu_migration_dest.sock'
+    cert_dir = 'certs'
     
-    server = MigrationWebSocketServer(host, port, unix_socket_path)
+    server = MigrationWebSocketServer(host, port, unix_socket_path, cert_dir)
     
     try:
         await server.start()
