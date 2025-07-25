@@ -13,6 +13,18 @@ async def execute_and_monitor_migration(qmp_client, destination_uri):
         qmp_client: An instance of QMPClient connected to the QEMU QMP socket.
         destination_uri: The destination URI for migration.
     """
+    # Enable multifd migration capability
+    print("Enabling multifd migration capability")
+    await qmp_client.execute('migrate-set-capabilities', {
+        'capabilities': [{'capability': 'multifd', 'state': True}]
+    })
+
+    # Set multifd channels
+    print("Setting multifd channels to 2")
+    await qmp_client.execute('migrate-set-parameters', {
+        'multifd-channels': 2
+    })
+
     # Start migration
     print(f"Starting migration to: {destination_uri}")
     migrate_result = await qmp_client.execute('migrate', {

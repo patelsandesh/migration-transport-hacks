@@ -3,6 +3,7 @@ import websockets
 import ssl
 import os
 import logging
+import uuid
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -14,6 +15,7 @@ class MigrationWebSocketServer:
         self.unix_socket_path = unix_socket_path or '/tmp/qemu_migration_dest.sock'
         self.cert_dir = cert_dir
         self.server = None
+        self.active_connections = {}  # Track active WebSocket connections
         
     def create_ssl_context(self):
         """Create SSL context for secure WebSocket connections."""
@@ -37,8 +39,9 @@ class MigrationWebSocketServer:
         return ssl_context
         
     async def handle_client(self, websocket):
-        """Handle incoming WebSocket connection and forward to unix socket."""
+        """Handle incoming WebSocket connection and create corresponding unix socket connection."""
         client_addr = websocket.remote_address
+        connection_id = str(uuid.uuid4())[:8]
         
         # Get client certificate info
         client_cert = websocket.transport.get_extra_info('ssl_object').getpeercert()
@@ -50,21 +53,30 @@ class MigrationWebSocketServer:
                         client_cn = value
                         break
         
-        logger.info(f"Secure WebSocket client connected from {client_addr} (CN: {client_cn})")
+        logger.info(f"WebSocket client {connection_id} connected from {client_addr} (CN: {client_cn})")
+        
+        # Store connection info
+        self.active_connections[connection_id] = {
+            'websocket': websocket,
+            'client_addr': client_addr,
+            'client_cn': client_cn
+        }
         
         try:
-            # Wait for the unix socket to be available (QEMU creates it after migrate-incoming)
-            logger.info(f"Waiting for unix socket at {self.unix_socket_path}")
-            unix_reader, unix_writer = await self.wait_for_unix_socket()
+            # Create a dedicated unix socket connection for this WebSocket
+            unix_socket_path = f"{self.unix_socket_path}"
             
-            logger.info(f"Connected to QEMU unix socket at {self.unix_socket_path}")
+            logger.info(f"Creating unix socket connection {connection_id} at {unix_socket_path}")
+            unix_reader, unix_writer = await self.create_unix_connection(unix_socket_path)
+            
+            logger.info(f"Connected to QEMU unix socket {connection_id} at {unix_socket_path}")
             
             # Create bidirectional forwarding tasks
             ws_to_unix = asyncio.create_task(
-                self.forward_ws_to_unix(websocket, unix_writer)
+                self.forward_ws_to_unix(websocket, unix_writer, connection_id)
             )
             unix_to_ws = asyncio.create_task(
-                self.forward_unix_to_ws(unix_reader, websocket)
+                self.forward_unix_to_ws(unix_reader, websocket, connection_id)
             )
             
             # Wait for either task to complete (indicating connection closed)
@@ -84,36 +96,43 @@ class MigrationWebSocketServer:
             # Close unix socket connection
             unix_writer.close()
             await unix_writer.wait_closed()
-            logger.info("Disconnected from QEMU unix socket")
+            logger.info(f"Disconnected from QEMU unix socket {connection_id}")
                 
         except asyncio.CancelledError:
-            logger.info("Client handler cancelled")
+            logger.info(f"Client handler {connection_id} cancelled")
         except Exception as e:
-            logger.error(f"Error handling client: {e}")
+            logger.error(f"Error handling client {connection_id}: {e}")
         finally:
-            logger.info(f"Secure WebSocket client {client_addr} disconnected")
+            # Remove from active connections
+            if connection_id in self.active_connections:
+                del self.active_connections[connection_id]
+            logger.info(f"WebSocket client {connection_id} ({client_addr}) disconnected")
     
-    async def wait_for_unix_socket(self, max_retries=30, retry_delay=1):
-        """Wait for unix socket to become available and connect to it."""
+    async def create_unix_connection(self, unix_socket_path):
+        """Create a unix socket connection to QEMU."""
+        # Wait for QEMU to create the unix socket after migrate-incoming
+        max_retries = 30
+        retry_delay = 1
+        
         for attempt in range(max_retries):
             try:
-                if os.path.exists(self.unix_socket_path):
+                if os.path.exists(unix_socket_path):
                     # Try to connect to the unix socket
                     unix_reader, unix_writer = await asyncio.open_unix_connection(
-                        path=self.unix_socket_path
+                        path=unix_socket_path
                     )
                     return unix_reader, unix_writer
                 else:
-                    logger.info(f"Unix socket not found, waiting... (attempt {attempt + 1}/{max_retries})")
+                    logger.info(f"Unix socket {unix_socket_path} not found, waiting... (attempt {attempt + 1}/{max_retries})")
                     
             except (ConnectionRefusedError, FileNotFoundError) as e:
-                logger.info(f"Cannot connect to unix socket, retrying... (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.info(f"Cannot connect to unix socket {unix_socket_path}, retrying... (attempt {attempt + 1}/{max_retries}): {e}")
             
             await asyncio.sleep(retry_delay)
         
-        raise Exception(f"Failed to connect to unix socket {self.unix_socket_path} after {max_retries} attempts")
+        raise Exception(f"Failed to connect to unix socket {unix_socket_path} after {max_retries} attempts")
     
-    async def forward_ws_to_unix(self, websocket, unix_writer):
+    async def forward_ws_to_unix(self, websocket, unix_writer, connection_id):
         """Forward data from WebSocket to Unix socket."""
         total_bytes = 0
         try:
@@ -124,37 +143,37 @@ class MigrationWebSocketServer:
                     total_bytes += len(message)
                     
                     if total_bytes % (1024 * 1024) == 0:  # Log every MB
-                        logger.info(f"WebSocket->Unix: Forwarded {total_bytes // (1024*1024)} MB")
+                        logger.info(f"WebSocket->Unix [{connection_id}]: Forwarded {total_bytes // (1024*1024)} MB")
                         
         except asyncio.CancelledError:
-            logger.info("WebSocket->Unix: Forwarding cancelled")
+            logger.info(f"WebSocket->Unix [{connection_id}]: Forwarding cancelled")
         except Exception as e:
-            logger.error(f"WebSocket->Unix: Error forwarding data: {e}")
+            logger.error(f"WebSocket->Unix [{connection_id}]: Error forwarding data: {e}")
         finally:
-            logger.info(f"WebSocket->Unix: Total bytes forwarded: {total_bytes}")
+            logger.info(f"WebSocket->Unix [{connection_id}]: Total bytes forwarded: {total_bytes}")
     
-    async def forward_unix_to_ws(self, unix_reader, websocket):
+    async def forward_unix_to_ws(self, unix_reader, websocket, connection_id):
         """Forward data from Unix socket to WebSocket."""
         total_bytes = 0
         try:
             while True:
                 data = await unix_reader.read(8192)
                 if not data:
-                    logger.info("Unix->WebSocket: Connection closed by peer")
+                    logger.info(f"Unix->WebSocket [{connection_id}]: Connection closed by peer")
                     break
                 
                 await websocket.send(data)
                 total_bytes += len(data)
                 
                 if total_bytes % (1024 * 1024) == 0:  # Log every MB
-                    logger.info(f"Unix->WebSocket: Forwarded {total_bytes // (1024*1024)} MB")
+                    logger.info(f"Unix->WebSocket [{connection_id}]: Forwarded {total_bytes // (1024*1024)} MB")
                     
         except asyncio.CancelledError:
-            logger.info("Unix->WebSocket: Forwarding cancelled")
+            logger.info(f"Unix->WebSocket [{connection_id}]: Forwarding cancelled")
         except Exception as e:
-            logger.error(f"Unix->WebSocket: Error forwarding data: {e}")
+            logger.error(f"Unix->WebSocket [{connection_id}]: Error forwarding data: {e}")
         finally:
-            logger.info(f"Unix->WebSocket: Total bytes forwarded: {total_bytes}")
+            logger.info(f"Unix->WebSocket [{connection_id}]: Total bytes forwarded: {total_bytes}")
     
     async def start(self):
         """Start the secure WebSocket server."""
@@ -173,8 +192,9 @@ class MigrationWebSocketServer:
         )
         
         logger.info(f"Secure Migration WebSocket server listening on wss://{self.host}:{self.port}")
-        logger.info(f"Will connect to unix socket at: {self.unix_socket_path}")
+        logger.info(f"Will create unix socket connections with base path: {self.unix_socket_path}")
         logger.info("Client certificate authentication enabled")
+        logger.info("Supporting multiple concurrent WebSocket connections")
         
         await self.server.wait_closed()
     

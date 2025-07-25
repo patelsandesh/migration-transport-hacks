@@ -70,6 +70,18 @@ async def setup_incoming_migration_websocket_forwarded(qmp_socket_path, websocke
         result = await qmp_client.execute('query-status')
         print(f"VM Status: {result}")
         
+        # Enable multifd migration capability
+        print("Enabling multifd migration capability")
+        await qmp_client.execute('migrate-set-capabilities', {
+            'capabilities': [{'capability': 'multifd', 'state': True}]
+        })
+
+        # Set multifd channels
+        print("Setting multifd channels to 2")
+        await qmp_client.execute('migrate-set-parameters', {
+            'multifd-channels': 2
+        })
+
         # Setup incoming migration
         print(f"Setting up incoming migration from: {incoming_uri}")
         migrate_incoming_result = await qmp_client.execute('migrate-incoming', {
