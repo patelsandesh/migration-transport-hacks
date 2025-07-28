@@ -2,6 +2,7 @@ import asyncio
 import socket
 import os
 import logging
+from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -12,25 +13,32 @@ class MigrationTCPServer:
         self.port = port
         self.unix_socket_path = unix_socket_path or '/tmp/qemu_migration_dest.sock'
         self.server = None
+        self.connection_counter = 0
+        self.read_histogram = defaultdict(int)  # Track histogram of bytes read
         
     async def handle_client(self, reader, writer):
         """Handle incoming TCP connection and forward to unix socket."""
+        self.connection_counter += 1
+        connection_id = self.connection_counter
         client_addr = writer.get_extra_info('peername')
-        logger.info(f"Client connected from {client_addr}")
+        logger.info(f"Connection #{connection_id}: Client connected from {client_addr}")
+        
+        unix_reader = None
+        unix_writer = None
         
         try:
-            # Wait for the unix socket to be available (QEMU creates it after migrate-incoming)
-            logger.info(f"Waiting for unix socket at {self.unix_socket_path}")
-            unix_reader, unix_writer = await self.wait_for_unix_socket()
+            # Connect to the unix socket for this TCP connection
+            logger.info(f"Connection #{connection_id}: Connecting to unix socket at {self.unix_socket_path}")
+            unix_reader, unix_writer = await self.connect_to_unix_socket()
             
-            logger.info(f"Connected to QEMU unix socket at {self.unix_socket_path}")
+            logger.info(f"Connection #{connection_id}: Connected to QEMU unix socket")
             
             # Create bidirectional forwarding tasks
             tcp_to_unix = asyncio.create_task(
-                self.forward_data(reader, unix_writer, "TCP->Unix")
+                self.forward_data(reader, unix_writer, f"Connection #{connection_id} TCP->Unix")
             )
             unix_to_tcp = asyncio.create_task(
-                self.forward_data(unix_reader, writer, "Unix->TCP")
+                self.forward_data(unix_reader, writer, f"Connection #{connection_id} Unix->TCP")
             )
             
             # Wait for either task to complete (indicating connection closed)
@@ -46,23 +54,22 @@ class MigrationTCPServer:
                     await task
                 except asyncio.CancelledError:
                     pass
-            
-            # Close unix socket connection
-            unix_writer.close()
-            await unix_writer.wait_closed()
-            logger.info("Disconnected from QEMU unix socket")
                 
         except asyncio.CancelledError:
-            logger.info("Client handler cancelled")
+            logger.info(f"Connection #{connection_id}: Client handler cancelled")
         except Exception as e:
-            logger.error(f"Error handling client: {e}")
+            logger.error(f"Connection #{connection_id}: Error handling client: {e}")
         finally:
+            # Clean up connections
+            if unix_writer:
+                unix_writer.close()
+                await unix_writer.wait_closed()
             writer.close()
             await writer.wait_closed()
-            logger.info(f"Client {client_addr} disconnected")
+            logger.info(f"Connection #{connection_id}: Client {client_addr} and unix socket disconnected")
     
-    async def wait_for_unix_socket(self, max_retries=30, retry_delay=1):
-        """Wait for unix socket to become available and connect to it."""
+    async def connect_to_unix_socket(self, max_retries=30, retry_delay=1):
+        """Connect to unix socket."""
         for attempt in range(max_retries):
             try:
                 if os.path.exists(self.unix_socket_path):
@@ -91,9 +98,13 @@ class MigrationTCPServer:
                     logger.info(f"{direction}: Connection closed by peer")
                     break
                 
+                # Track bytes read in histogram
+                bytes_read = len(data)
+                self.read_histogram[bytes_read] += 1
+                
                 writer.write(data)
                 await writer.drain()
-                total_bytes += len(data)
+                total_bytes += bytes_read
                 
                 if total_bytes % (1024 * 1024) == 0:  # Log every MB
                     logger.info(f"{direction}: Forwarded {total_bytes // (1024*1024)} MB")
@@ -104,6 +115,24 @@ class MigrationTCPServer:
             logger.error(f"{direction}: Error forwarding data: {e}")
         finally:
             logger.info(f"{direction}: Total bytes forwarded: {total_bytes}")
+    
+    def print_histogram(self):
+        """Print histogram of bytes read when exiting."""
+        logger.info("=== Read Bytes Histogram ===")
+        if not self.read_histogram:
+            logger.info("No data read")
+            return
+            
+        # Sort by byte count for better readability
+        sorted_histogram = sorted(self.read_histogram.items())
+        total_reads = sum(self.read_histogram.values())
+        
+        for byte_count, frequency in sorted_histogram:
+            percentage = (frequency / total_reads) * 100
+            logger.info(f"{byte_count:5d} bytes: {frequency:5d} times ({percentage:5.1f}%)")
+        
+        logger.info(f"Total reads: {total_reads}")
+        logger.info("============================")
     
     async def start(self):
         """Start the TCP server."""
@@ -139,6 +168,9 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Shutting down server...")
         await server.stop()
+    finally:
+        # Print histogram when exiting
+        server.print_histogram()
 
 if __name__ == "__main__":
     asyncio.run(main())

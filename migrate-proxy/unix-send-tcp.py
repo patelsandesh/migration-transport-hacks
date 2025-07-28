@@ -75,6 +75,21 @@ async def migrate_vm_tcp_forwarded(qmp_socket_path, tcp_unix_socket_path=None):
         result = await qmp_client.execute('query-status')
         print(f"VM Status: {result}")
         
+        # Enable multifd migration capability
+        print("Enabling multifd migration capability")
+        await qmp_client.execute('migrate-set-capabilities', {
+            'capabilities': [{'capability': 'multifd', 'state': True}]
+        })
+
+        # Configure migration parameters
+        print("Setting migration multfd channels to 2...")
+        await qmp_client.execute('migrate-set-parameters', {
+            'multifd-channels': 2
+        })
+    
+        
+        print("Migration parameters configured successfully")
+        
         # Execute and monitor migration
         await execute_and_monitor_migration(qmp_client, destination_uri)
             
@@ -85,7 +100,7 @@ async def migrate_vm_tcp_forwarded(qmp_socket_path, tcp_unix_socket_path=None):
 
 async def main():
     # Default QMP socket path - adjust as needed
-    qmp_socket = "/var/run/qemu-server/vm.qmp"
+    qmp_socket = "/tmp/qemu-monitor.sock"
     
     # TCP-forwarded unix socket path (created by tcp-migration-client.py)
     tcp_unix_socket = "/tmp/qemu_migration_source.sock"
