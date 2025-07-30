@@ -79,7 +79,7 @@ async def setup_incoming_migration_tcp_forwarded(qmp_socket_path, tcp_unix_socke
         # Configure migration parameters for destination
         print("Setting migration multfd channels to 2 on destination...")
         await qmp_client.execute('migrate-set-parameters', {
-            'multifd-channels': 2
+            'multifd-channels': 1
         })
         
         

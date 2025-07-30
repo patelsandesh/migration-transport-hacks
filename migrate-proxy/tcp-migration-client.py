@@ -1,10 +1,36 @@
 import asyncio
 import os
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+class CircularQueue:
+    def __init__(self, maxsize=1000):
+        self.queue = deque(maxlen=maxsize)
+        self.lock = asyncio.Lock()
+        self.not_empty = asyncio.Condition(self.lock)
+        self.closed = False
+    
+    async def put(self, item):
+        async with self.not_empty:
+            if not self.closed:
+                self.queue.append(item)
+                self.not_empty.notify()
+    
+    async def get(self):
+        async with self.not_empty:
+            while len(self.queue) == 0 and not self.closed:
+                await self.not_empty.wait()
+            if self.queue:
+                return self.queue.popleft()
+            return None
+    
+    async def close(self):
+        async with self.not_empty:
+            self.closed = True
+            self.not_empty.notify_all()
 
 class MigrationTCPClient:
     def __init__(self, server_host, server_port=9999, unix_socket_path=None):
@@ -91,30 +117,63 @@ class MigrationTCPClient:
             logger.info(f"Connection #{connection_id}: QEMU and TCP connections closed")
     
     async def forward_data(self, reader, writer, direction):
-        """Forward data between reader and writer."""
+        """Forward data between reader and writer using a circular queue."""
         total_bytes = 0
-        try:
-            while True:
-                data = await reader.read(8192)
-                if not data:
-                    logger.info(f"{direction}: Connection closed by peer")
-                    break
-                
-                # Track bytes read in histogram
-                bytes_read = len(data)
-                self.read_histogram[bytes_read] += 1
-                
-                writer.write(data)
-                await writer.drain()
-                total_bytes += bytes_read
-                
-                if total_bytes % (1024 * 1024) == 0:  # Log every MB
-                    logger.info(f"{direction}: Forwarded {total_bytes // (1024*1024)} MB")
+        queue = CircularQueue(maxsize=1000)
+        
+        async def read_task():
+            try:
+                while True:
+                    data = await reader.read(8192)
+                    if not data:
+                        logger.info(f"{direction}: Connection closed by peer")
+                        break
                     
+                    # Track bytes read in histogram
+                    bytes_read = len(data)
+                    self.read_histogram[bytes_read] += 1
+                    
+                    await queue.put(data)
+                    
+            except asyncio.CancelledError:
+                logger.info(f"{direction}: Read task cancelled")
+            except Exception as e:
+                logger.error(f"{direction}: Error reading data: {e}")
+            finally:
+                await queue.close()
+        
+        async def write_task():
+            nonlocal total_bytes
+            try:
+                while True:
+                    data = await queue.get()
+                    if data is None:  # Queue closed and empty
+                        break
+                    
+                    writer.write(data)
+                    # await writer.drain()
+                    total_bytes += len(data)
+                    
+                    if total_bytes % (1024 * 1024) == 0:  # Log every MB
+                        logger.info(f"{direction}: Forwarded {total_bytes // (1024*1024)} MB")
+                        
+            except asyncio.CancelledError:
+                logger.info(f"{direction}: Write task cancelled")
+            except Exception as e:
+                logger.error(f"{direction}: Error writing data: {e}")
+        
+        try:
+            # Start both read and write tasks
+            read_worker = asyncio.create_task(read_task())
+            write_worker = asyncio.create_task(write_task())
+            
+            # Wait for both to complete
+            await asyncio.gather(read_worker, write_worker, return_exceptions=True)
+            
         except asyncio.CancelledError:
             logger.info(f"{direction}: Forwarding cancelled")
         except Exception as e:
-            logger.error(f"{direction}: Error forwarding data: {e}")
+            logger.error(f"{direction}: Error in forwarding tasks: {e}")
         finally:
             logger.info(f"{direction}: Total bytes forwarded: {total_bytes}")
     

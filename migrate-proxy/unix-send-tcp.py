@@ -84,7 +84,7 @@ async def migrate_vm_tcp_forwarded(qmp_socket_path, tcp_unix_socket_path=None):
         # Configure migration parameters
         print("Setting migration multfd channels to 2...")
         await qmp_client.execute('migrate-set-parameters', {
-            'multifd-channels': 2
+            'multifd-channels': 1
         })
     
         
