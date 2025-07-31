@@ -105,6 +105,12 @@ async def main(fd):
         print(f"Error executing query-status: {e}")
         await qemp.disconnect()
     
+    # Configure migration parameters
+    print("Setting migration parameters...")
+    await qemp.execute('migrate-set-parameters', {
+        'max-bandwidth': 107374182400  # 100GB/s in bytes per second
+    })
+    
     if fd is None:
         socket = await server("0", SERVER_PORT)
         if not socket:

@@ -129,7 +129,7 @@ int prepare_and_send_fd(int file_fd) {
 int tcp_connect(void)
 {
 	const char *PORT = "5556";
-	const char *SERVER = "10.117.25.140";
+	const char *SERVER = "10.117.30.218";
 	int err, sd;
 	struct sockaddr_in sa;
 

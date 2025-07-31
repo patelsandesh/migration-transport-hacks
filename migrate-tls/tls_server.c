@@ -17,9 +17,9 @@
 #include <gnutls/gnutls.h>
 #include <assert.h>
 
-#define KEYFILE "/home/nutanix/x509-server-key.pem"
-#define CERTFILE "/home/nutanix/x509-server.pem"
-#define CAFILE "/home/nutanix/x509-ca.pem"
+#define KEYFILE "x509-server-key.pem"
+#define CERTFILE "x509-server.pem"
+#define CAFILE "x509-ca.pem"
 // #define CRLFILE "crl.pem"
 
 #define CHECK(x) assert((x) >= 0)
